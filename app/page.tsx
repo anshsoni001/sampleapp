@@ -11,7 +11,7 @@ export default function Home() {
           href="/products"
           className="inline-block bg-white text-blue-600 font-bold py-3 px-6 rounded-lg hover:bg-gray-100 transition"
         >
-          Shop Now
+          Shop Now with us
         </Link>
       </section>
 
