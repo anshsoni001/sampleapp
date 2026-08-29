@@ -1,0 +1,367 @@
+name: Deploy Node.js Application
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      project_slug:
+        description: Kubernetes project name
+        required: false
+        type: string
+
+      app_port:
+        description: Application port
+        required: false
+        default: "3000"
+        type: string
+
+      health_path:
+        description: Health check path
+        required: false
+        default: "/health"
+        type: string
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - launchpad-runner
+
+    permissions:
+      contents: read
+
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      DOCKERHUB_REPOSITORY: launchpad-apps
+      PUBLIC_BASE_DOMAIN: ${{ vars.PUBLIC_BASE_DOMAIN }}
+      INPUT_PROJECT_SLUG: ${{ inputs.project_slug }}
+      INPUT_APP_PORT: ${{ inputs.app_port }}
+      INPUT_HEALTH_PATH: ${{ inputs.health_path }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Validate Node.js project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f package.json ]; then
+            echo "package.json was not found"
+            exit 1
+          fi
+
+          if ! node -e "const p=require('./package.json'); if (!p.scripts || !p.scripts.start) process.exit(1)"; then
+            echo "package.json must contain a scripts.start command"
+            exit 1
+          fi
+
+          echo "Node.js project validation passed"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEST_SCRIPT="$(node -e "const p=require('./package.json'); process.stdout.write(p.scripts?.test || '')")"
+
+          if [ -z "$TEST_SCRIPT" ] || [ "$TEST_SCRIPT" = "echo \"Error: no test specified\" && exit 1" ]; then
+            echo "No test script configured. Skipping tests."
+            exit 0
+          fi
+
+          npm test
+
+      - name: Calculate release values
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPOSITORY_NAME="${GITHUB_REPOSITORY##*/}"
+
+          PROJECT_SLUG="${INPUT_PROJECT_SLUG:-$REPOSITORY_NAME}"
+          PROJECT_SLUG="$(printf '%s' "$PROJECT_SLUG" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')"
+
+          if ! printf '%s' "$PROJECT_SLUG" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'; then
+            echo "Invalid project slug"
+            exit 1
+          fi
+
+          if [ "${#PROJECT_SLUG}" -gt 40 ]; then
+            PROJECT_SLUG="${PROJECT_SLUG:0:40}"
+            PROJECT_SLUG="${PROJECT_SLUG%-}"
+          fi
+
+          APP_PORT="${INPUT_APP_PORT:-3000}"
+          HEALTH_PATH="${INPUT_HEALTH_PATH:-/health}"
+
+          if ! printf '%s' "$APP_PORT" | grep -Eq '^[0-9]+$' || [ "$APP_PORT" -lt 1 ] || [ "$APP_PORT" -gt 65535 ]; then
+            echo "Invalid application port"
+            exit 1
+          fi
+
+          if ! printf '%s' "$HEALTH_PATH" | grep -Eq '^/[A-Za-z0-9._/~!$&()*+,;=:@%-]*$'; then
+            echo "Invalid health path"
+            exit 1
+          fi
+
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+          IMAGE_TAG="${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:${PROJECT_SLUG}-${SHORT_SHA}"
+          NAMESPACE="launchpad-${PROJECT_SLUG}"
+          APP_HOST="${PROJECT_SLUG}.${PUBLIC_BASE_DOMAIN}"
+
+          {
+            echo "PROJECT_SLUG=$PROJECT_SLUG"
+            echo "APP_PORT=$APP_PORT"
+            echo "HEALTH_PATH=$HEALTH_PATH"
+            echo "SHORT_SHA=$SHORT_SHA"
+            echo "IMAGE_TAG=$IMAGE_TAG"
+            echo "NAMESPACE=$NAMESPACE"
+            echo "APP_HOST=$APP_HOST"
+            echo "APP_URL=http://${APP_HOST}"
+          } >> "$GITHUB_ENV"
+
+      - name: Check Kubernetes connection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl get nodes
+          kubectl auth can-i create deployments --all-namespaces
+
+      - name: Create Dockerfile when needed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f Dockerfile ]; then
+            echo "Using repository Dockerfile"
+            exit 0
+          fi
+
+          if [ -f package-lock.json ]; then
+            INSTALL_COMMAND="npm ci --omit=dev"
+          else
+            INSTALL_COMMAND="npm install --omit=dev"
+          fi
+
+          cat > Dockerfile <<EOF
+          FROM node:20-alpine
+
+          WORKDIR /app
+
+          COPY package*.json ./
+          RUN ${INSTALL_COMMAND}
+
+          COPY . .
+
+          ENV NODE_ENV=production
+          ENV PORT=${APP_PORT}
+
+          EXPOSE ${APP_PORT}
+
+          USER node
+
+          CMD ["npm", "start"]
+          EOF
+
+          echo "Generated Dockerfile"
+
+      - name: Build Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker build \
+            --pull \
+            --tag "$IMAGE_TAG" \
+            .
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_TAG"
+
+      - name: Generate Kubernetes manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/launchpad-manifest.yaml <<EOF
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: ${NAMESPACE}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${PROJECT_SLUG}
+            namespace: ${NAMESPACE}
+            labels:
+              app: ${PROJECT_SLUG}
+          spec:
+            replicas: 2
+            revisionHistoryLimit: 5
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxUnavailable: 0
+                maxSurge: 1
+            selector:
+              matchLabels:
+                app: ${PROJECT_SLUG}
+            template:
+              metadata:
+                labels:
+                  app: ${PROJECT_SLUG}
+              spec:
+                containers:
+                  - name: app
+                    image: ${IMAGE_TAG}
+                    imagePullPolicy: Always
+                    ports:
+                      - name: http
+                        containerPort: ${APP_PORT}
+                    env:
+                      - name: PORT
+                        value: "${APP_PORT}"
+                      - name: NODE_ENV
+                        value: "production"
+                    readinessProbe:
+                      httpGet:
+                        path: ${HEALTH_PATH}
+                        port: http
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                      timeoutSeconds: 3
+                      failureThreshold: 12
+                    livenessProbe:
+                      httpGet:
+                        path: ${HEALTH_PATH}
+                        port: http
+                      initialDelaySeconds: 20
+                      periodSeconds: 15
+                      timeoutSeconds: 3
+                    resources:
+                      requests:
+                        cpu: "50m"
+                        memory: "64Mi"
+                      limits:
+                        cpu: "500m"
+                        memory: "512Mi"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${PROJECT_SLUG}
+            namespace: ${NAMESPACE}
+          spec:
+            selector:
+              app: ${PROJECT_SLUG}
+            ports:
+              - name: http
+                port: 80
+                targetPort: http
+            type: ClusterIP
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${PROJECT_SLUG}
+            namespace: ${NAMESPACE}
+          spec:
+            ingressClassName: traefik
+            rules:
+              - host: ${APP_HOST}
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: ${PROJECT_SLUG}
+                          port:
+                            name: http
+          EOF
+
+          kubectl apply -f /tmp/launchpad-manifest.yaml
+
+      - name: Wait for Kubernetes rollout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          kubectl rollout status \
+            "deployment/${PROJECT_SLUG}" \
+            --namespace "$NAMESPACE" \
+            --timeout=240s
+
+          kubectl get pods \
+            --namespace "$NAMESPACE" \
+            --output wide
+
+      - name: Check public health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HEALTH_URL="${APP_URL}${HEALTH_PATH}"
+          echo "Checking ${HEALTH_URL}"
+
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error --max-time 10 "$HEALTH_URL"; then
+              echo
+              echo "Health check passed"
+              exit 0
+            fi
+
+            echo "Health check attempt ${attempt}/12 failed"
+            sleep 5
+          done
+
+          echo "Health check failed"
+          kubectl describe deployment "$PROJECT_SLUG" --namespace "$NAMESPACE"
+          kubectl get events --namespace "$NAMESPACE" --sort-by=.lastTimestamp
+          exit 1
+
+      - name: Print deployment summary
+        if: success()
+        shell: bash
+        run: |
+          echo "Deployment succeeded"
+          echo "Image: $IMAGE_TAG"
+          echo "URL: $APP_URL"
+          echo "Commit: $GITHUB_SHA"
