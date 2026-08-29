@@ -154,7 +154,7 @@ jobs:
           kubectl get nodes
           kubectl auth can-i create deployments --all-namespaces
 
-      - name: Create Dockerfile when needed
+      - name: Generate Dockerfile automatically
         shell: bash
         run: |
           set -euo pipefail
@@ -164,21 +164,28 @@ jobs:
             exit 0
           fi
 
-          if [ -f package-lock.json ]; then
-            INSTALL_COMMAND="npm ci --omit=dev"
-          else
-            INSTALL_COMMAND="npm install --omit=dev"
-          fi
+          IS_NEXT="$(node -e "
+            const p = require('./package.json');
+            const deps = { ...(p.dependencies || {}), ...(p.devDependencies || {}) };
+            process.stdout.write(deps.next ? 'true' : 'false');
+          ")"
 
-          cat > Dockerfile <<EOF
+          if [ "$IS_NEXT" = "true" ]; then
+            echo "Next.js detected"
+
+            cat > Dockerfile <<EOF
           FROM node:20-alpine
 
           WORKDIR /app
 
           COPY package*.json ./
-          RUN ${INSTALL_COMMAND}
+          RUN npm ci
 
           COPY . .
+
+          RUN npm run build
+          RUN npm prune --omit=dev
+          RUN chown -R node:node /app
 
           ENV NODE_ENV=production
           ENV PORT=${APP_PORT}
@@ -189,8 +196,32 @@ jobs:
 
           CMD ["npm", "start"]
           EOF
+          else
+            echo "Standard Node.js application detected"
 
-          echo "Generated Dockerfile"
+            cat > Dockerfile <<EOF
+          FROM node:20-alpine
+
+          WORKDIR /app
+
+          COPY package*.json ./
+          RUN npm ci --omit=dev
+
+          COPY --chown=node:node . .
+
+          ENV NODE_ENV=production
+          ENV PORT=${APP_PORT}
+
+          EXPOSE ${APP_PORT}
+
+          USER node
+
+          CMD ["npm", "start"]
+          EOF
+          fi
+
+          echo "Generated Dockerfile:"
+          sed 's/^/  /' Dockerfile
 
       - name: Build Docker image
         shell: bash
