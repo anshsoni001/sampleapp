@@ -61,7 +61,7 @@ export default function Cart() {
 
               <div className="space-y-4 mb-6 pb-6 border-b">
                 <div className="flex justify-between">
-                  <span>Subtotal</span>
+                  <span>Subtotall</span>
                   <span>${subtotal.toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
